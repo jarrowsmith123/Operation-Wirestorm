@@ -15,28 +15,31 @@ const READ_TIMEOUT_SECS: u64 = 10; // Prevent slow clients holding connection in
 
 /// Represents a parsed CTMP message header
 /// 1 magic byte = 0xCC
-/// 1 byte of padding 0s
+/// 1 byte for the options where bit 1 represents a sensitive message i.e. 0100 0000
 /// 2 bytes for the length of payload (16-bit limit provides implicit max payload size of 65,535 bytes)
-/// 4 paddings bytes of 0s
+/// 2 bytes for the checksum
+/// 2 bytes of 0s for padding
 struct Header {
     magic: u8,
-    padding1: u8,
+    options: u8,
     length: u16,
-    padding2: u32,
+    checksum: u16, // This is unused but kept for self documentation
+    padding: u16,
 }
 
 impl Header {
     // Creates a Header struct from an 8-byte buffer
     pub fn from_bytes(bytes: &[u8; HEADER_SIZE]) -> Self {
-        // We need bigendian bytes due to specification
         let length: u16 = u16::from_be_bytes([bytes[2], bytes[3]]);
-        let padding2: u32 = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let checksum: u16 = u16::from_be_bytes([bytes[4], bytes[5]]);
+        let padding: u16 = u16::from_be_bytes([bytes[6], bytes[7]]);
 
         Header {
             magic: bytes[0],
-            padding1: bytes[1],
+            options: bytes[1],
             length,
-            padding2,
+            checksum,
+            padding,
         }
     }
 
@@ -44,13 +47,53 @@ impl Header {
     /// Magic byte must be 0xCC and both padding bytes should be filled with 0s
     /// Length is implicitly bounded by size of u16
     pub fn is_valid(&self) -> bool {
-        self.magic == MAGIC && self.padding1 == 0 && self.padding2 == 0
+        self.magic == MAGIC && self.padding == 0
+    }
+
+    pub fn is_sensitive(&self) -> bool {
+        (self.options & 0b0100_0000) != 0
     }
 
     /// Returns the payload length as a usize for vec allocation
     pub fn payload_length(&self) -> usize {
         self.length as usize
     }
+}
+
+/// We can optimise the checksum calculation by with the following derivation:
+/// 1. The sender's checksum (CS) is CS = !(Sum(Data) + 0xCCCC)
+/// 2. The receiver calculates the sum of the full message (RCS) = Sum(Data) + CS
+/// 3. Substituting CS, we get RCS = Sum(Data) + !(Sum(Data) + 0xCCCC)
+/// 4. Using !X = 0xFFFF - X we can then get RCS = Sum(Data) + (0xFFFF - (Sum(Data) + 0xCCCC))
+/// 5. Sum(Data) is cancelled out, leaving us with RCS = 0xFFFF - 0xCCCC = 0x3333
+/// 6. Our function requires the final one's complement of this sum, !0x3333, which is 0xCCCC
+///
+/// This function can now be simplified to sum each 16bit page and compare its one's complement to
+/// the expected value of 0xCCCC
+fn validate_checksum(data: &[u8]) -> bool {
+    let mut sum: u32 = 0;
+    let mut chunks = data.chunks_exact(2);
+
+    // Sum all 16-bit words
+    for chunk in chunks.by_ref() {
+        let word = u16::from_be_bytes([chunk[0], chunk[1]]);
+        sum += u32::from(word);
+    }
+
+    // If there's an odd byte left, pad it with a zero byte and add to sum
+    if let Some(&last_byte) = chunks.remainder().first() {
+        let word = u16::from_be_bytes([last_byte, 0]);
+        sum += u32::from(word);
+    }
+
+    // Fold the 32-bit sum into 16 bits
+    while (sum >> 16) > 0 {
+        sum = (sum >> 16) + (sum & 0xFFFF);
+    }
+
+    let checksum = !sum as u16;
+
+    checksum == 0xCCCC
 }
 
 // ============== Main Server Logic ================
@@ -93,7 +136,7 @@ fn main() -> io::Result<()> {
         }
     });
 
-    // -------------- Source listener thread (just the main thread)  -----------------
+    // -------------- Source listener thread   -----------------
     let source_listener = TcpListener::bind(SOURCE_ADDR)?;
     println!("Listening for single source client on {SOURCE_ADDR}");
 
@@ -116,6 +159,8 @@ fn main() -> io::Result<()> {
         }
     }
 }
+
+// -------------- Handle source ----------------
 
 // Handles a source client connection
 fn handle_source_client(mut stream: TcpStream, destinations: Arc<Mutex<Vec<TcpStream>>>) {
@@ -141,7 +186,10 @@ fn handle_source_client(mut stream: TcpStream, destinations: Arc<Mutex<Vec<TcpSt
         match stream.read_exact(&mut header_buf) {
             Ok(_) => {
                 let header = Header::from_bytes(&header_buf);
-                // Validate ctmp header (magic byte and padding fields)
+                // Validate ctmp header
+                // Note that we could keep this source open for more messages
+                // but I think it makes sense to just break the connection when considered faulty
+                // or if the specification says otherwise
                 if !header.is_valid() {
                     eprintln!("Invalid CTMP header from source {address}. Disconnecting.");
                     break;
@@ -158,9 +206,17 @@ fn handle_source_client(mut stream: TcpStream, destinations: Arc<Mutex<Vec<TcpSt
                     break;
                 }
 
-                // Combine header and payload into final message to send
+                // Create full message from header and payload
                 let full_message = [header_buf.as_slice(), &payload_buf].concat();
-                // Lock destination list whilst we broadcast
+
+                // For sensitive messages, validate the checksum before forwarding
+                if header.is_sensitive() && !validate_checksum(&full_message) {
+                    eprintln!(
+                        "Invalid checksum for sensitive message from {address}. Dropping message."
+                    );
+                    continue; // Drop invalid message, wait for the next one
+                }
+
                 let mut dests = destinations.lock().unwrap();
                 println!(
                     "Relaying CTMP message of {} bytes from {} to {} destination clients.",
@@ -170,17 +226,15 @@ fn handle_source_client(mut stream: TcpStream, destinations: Arc<Mutex<Vec<TcpSt
                 );
 
                 // Iterate through destination clients and remove disconnected clients
-                // retain_mut keeps clients that successfully receive the message
                 dests.retain_mut(|dest_stream| {
-                        // A write failure indicates client has disconnected
-                        match dest_stream.write_all(&full_message) {
-                            Ok(_) => true,  // Keep this client
-                            Err(_) => {
-                                println!("Destination client disconnected during broadcast, removing from list.");
-                                false  // Remove this client
-                            }
+                    match dest_stream.write_all(&full_message) {
+                        Ok(_) => true, // Keep this client
+                        Err(_) => {
+                            println!("Destination client disconnected during broadcast, removing from list.");
+                            false // Remove this client
                         }
-                    });
+                    }
+                });
             }
             // This error means the client closed the connection gracefully
             Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {

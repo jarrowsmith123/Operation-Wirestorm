@@ -124,11 +124,19 @@ class TestSolution(unittest.TestCase):
     def test_multiple_receivers(self):
         self._test_case(data=buffers.getb(buffers.t_basic), thread_count=20)
 
+    def test_invalid_checksum(self):
+        self._test_case(
+            data=buffers.getb(buffers.t_invalid_checksum), expect_timeout=True
+        )
+
+    def test_transmitted_with_sensitive_disabled(self):
+        self._test_case(data=buffers.getb(buffers.t_basic_no_checksum))
+
     ##########################################################################
 
 
 if __name__ == "__main__":
     print(buffers.gets(buffers.s1))
     res = unittest.main(exit=False)
-    if not res.result.failures and not res.result.errors and res.result.testsRun >= 4:
+    if not res.result.failures and not res.result.errors and res.result.testsRun >= 7:
         print(buffers.gets(buffers.s2))
