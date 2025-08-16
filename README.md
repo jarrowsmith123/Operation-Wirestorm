@@ -1,6 +1,6 @@
 # CTMP Proxy Server
 
-A TCP proxy server implementation for the CoreTech Message Protocol (CTMP) written in Rust. Submitted as part of the Operation Wirestorm - Reloaded competition.
+A TCP proxy server implementation for the CoreTech Message Protocol (CTMP) written in Rust. Submitted as part of the Operation Wirestorm competition.
 
 ## Overview
 
@@ -62,7 +62,8 @@ For sensitive messages:
 
 - **Ubuntu 24.04 LTS**
 - **Rust 1.70+**
-- **TCP ports 33333 and 44444** available
+- **TCP ports 33333 and 44444 available**
+- **Netcat installed** (for testing)
 
 ## Installation
 
@@ -72,8 +73,7 @@ For sensitive messages:
 # Install Rust via rustup 
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Reload shell environment
-source ~/.bashrc
+# IMPORTANT: Reload your shell environment
 
 # Verify installation
 rustc --version
@@ -91,9 +91,11 @@ cd operation-wirestorm
 cargo build
 ```
 
-## Usage
+## Usage and testing
 
-### Start the Server
+We will use netcat to send and receive tcp messages on a local machine.
+
+### Step 1: Start the Server
 
 ```bash
 # Run directly with cargo
@@ -110,14 +112,35 @@ Listening for destination clients on 127.0.0.1:44444
 Listening for single source client on 127.0.0.1:33333
 ```
 
-### Message Processing Behavior
+### Step 2: Start a Listener
 
-- **Normal Messages**: Forwarded immediately to all connected destinations
-- **Sensitive Messages**: Checksum validated before forwarding
-  - Valid checksums: Message forwarded normally
-  - Invalid checksums: Message dropped, error logged, connection remains open
-- **Invalid Headers**: Source client disconnected immediately
-- **Connection Errors**: Affected clients disconnected and cleaned up automatically
+This client will receive messages forwarded by the proxy.
+
+1.  Open a second terminal.
+2.  Use `netcat` to connect to the destination port (`44444`).
+
+```bash
+nc localhost 44444
+```
+
+### Step 3: Send Messages (Source Client)
+
+Open a third terminal to send a message to the server's source port (`33333`).
+
+#### Example:
+This sends the message "hello".
+- **MAGIC**: `\xcc`
+- **OPTIONS**: `\x40` (sensitive bit is 1)
+- **LENGTH**: `\x00\x05`
+- **CHECKSUM**: `\x23\x1b`
+- **PADDING**: `\x00\x00`
+- **DATA**: `hello`
+
+In your **third terminal**, run:
+```bash
+printf "\xcc\x00\x00\x05\x23\x1b\x00\x00hello" | nc localhost 33333
+```
+The text `hello` will appear in the listener (second) terminal, along with the data header. This may appear as jumbled characters in the terminal.
 
 ## Testing with Provided Python Tests
 
@@ -126,7 +149,7 @@ The project includes the supplied Python 3.12 tests for the competition.
 ### Prerequisites for Testing
 
 ```bash
-# Ensure Python 3.12+ is installed
+# Ensure Python 3.12 is installed
 python3 --version
 ```
 
@@ -163,7 +186,7 @@ const READ_TIMEOUT_SECS: u64 = 10;                // Client read timeout
 1. Source client connects and sends CTMP messages
 2. Server validates message headers (magic byte, padding)
 3. For sensitive messages: checksum validation performed
-4. Valid messages broadcasted to all connected destination clients -- Note that the length in the header is always trusted, data longer than that length in the stream is ignore - this is a potential drawback of the server --
+4. Valid messages broadcasted to all connected destination clients -- Note that the length in the header is always trusted, data longer than that length in the stream is ignored - this is a potential drawback of the server --
 5. Disconnected destination clients removed during broadcast
 
 
