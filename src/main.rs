@@ -23,7 +23,7 @@ struct Header {
     magic: u8,
     options: u8,
     length: u16,
-    checksum: u16, // This is unused but kept for self documentation
+    checksum: u16,
     padding: u16,
 }
 
@@ -58,43 +58,43 @@ impl Header {
     pub fn payload_length(&self) -> usize {
         self.length as usize
     }
+
+    // The checksum is calculated by summing all 16 bit words of the entire message
+    // with 0xCCCC as the checksum for calculation
+    // We keep adding the sum until it becomes a 16 bit number
+    // The checksum is then the ones complement of this number
+    // ---- The specification wording is slightly unclear on this but this is my interpretation ------
+    pub fn validate_checksum(&self, data: &[u8]) -> bool {
+        let mut sum: u32 = 0;
+        let mut chunks = data.chunks_exact(2);
+
+        sum += u16::from_be_bytes([self.magic, self.options]) as u32;
+        sum += self.length as u32;
+        sum += 0xCCCC_u32;
+
+        // Sum all 16-bit words
+        for chunk in chunks.by_ref() {
+            let word = u16::from_be_bytes([chunk[0], chunk[1]]);
+            sum += u32::from(word);
+        }
+
+        // If there's an odd byte left, pad it with a zero byte and add to sum
+        if let Some(&last_byte) = chunks.remainder().first() {
+            let word = u16::from_be_bytes([last_byte, 0]);
+            sum += u32::from(word);
+        }
+
+        // Fold the 32-bit sum into 16 bits
+        while (sum >> 16) > 0 {
+            sum = (sum >> 16) + (sum & 0xFFFF);
+        }
+
+        let checksum = !sum as u16;
+
+        checksum == self.checksum
+    }
 }
 
-/// We can optimise the checksum calculation by with the following derivation:
-/// 1. The sender's checksum (CS) is CS = !(Sum(Data) + 0xCCCC)
-/// 2. The receiver calculates the sum of the full message (RCS) = Sum(Data) + CS
-/// 3. Substituting CS, we get RCS = Sum(Data) + !(Sum(Data) + 0xCCCC)
-/// 4. Using !X = 0xFFFF - X we can then get RCS = Sum(Data) + (0xFFFF - (Sum(Data) + 0xCCCC))
-/// 5. Sum(Data) is cancelled out, leaving us with RCS = 0xFFFF - 0xCCCC = 0x3333
-/// 6. Our function requires the final one's complement of this sum, !0x3333, which is 0xCCCC
-///
-/// This function can now be simplified to sum each 16bit page and compare its one's complement to
-/// the expected value of 0xCCCC
-fn validate_checksum(data: &[u8]) -> bool {
-    let mut sum: u32 = 0;
-    let mut chunks = data.chunks_exact(2);
-
-    // Sum all 16-bit words
-    for chunk in chunks.by_ref() {
-        let word = u16::from_be_bytes([chunk[0], chunk[1]]);
-        sum += u32::from(word);
-    }
-
-    // If there's an odd byte left, pad it with a zero byte and add to sum
-    if let Some(&last_byte) = chunks.remainder().first() {
-        let word = u16::from_be_bytes([last_byte, 0]);
-        sum += u32::from(word);
-    }
-
-    // Fold the 32-bit sum into 16 bits
-    while (sum >> 16) > 0 {
-        sum = (sum >> 16) + (sum & 0xFFFF);
-    }
-
-    let checksum = !sum as u16;
-
-    checksum == 0xCCCC
-}
 
 // ============== Main Server Logic ================
 
@@ -187,7 +187,7 @@ fn handle_source_client(mut stream: TcpStream, destinations: Arc<Mutex<Vec<TcpSt
             Ok(_) => {
                 let header = Header::from_bytes(&header_buf);
                 // Validate ctmp header
-                // Note that we could keep this source open for more messages
+                // Note that we could continue to keep this source open for more messages
                 // but I think it makes sense to just break the connection when considered faulty
                 // or if the specification says otherwise
                 if !header.is_valid() {
@@ -210,7 +210,7 @@ fn handle_source_client(mut stream: TcpStream, destinations: Arc<Mutex<Vec<TcpSt
                 let full_message = [header_buf.as_slice(), &payload_buf].concat();
 
                 // For sensitive messages, validate the checksum before forwarding
-                if header.is_sensitive() && !validate_checksum(&full_message) {
+                if header.is_sensitive() && !header.validate_checksum(&payload_buf) {
                     eprintln!(
                         "Invalid checksum for sensitive message from {address}. Dropping message."
                     );
@@ -236,16 +236,26 @@ fn handle_source_client(mut stream: TcpStream, destinations: Arc<Mutex<Vec<TcpSt
                     }
                 });
             }
-            // This error means the client closed the connection gracefully
-            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                println!("Source client {address} disconnected gracefully.");
-                break;
-            }
-            // This will catch other errors, such as the read timeout
             Err(e) => {
-                eprintln!("Error reading from source {address}: {e}. Disconnecting.");
+                match e.kind() {
+                    // TimedOut occurs if the client sends no data for READ_TIMEOUT_SECS after sending a message
+                    // It would be easy to remove this timeout as it is not in the specification
+                    // I just wanted to consider it
+                    io::ErrorKind::WouldBlock => {
+                        eprintln!("Source client {address} timed out waiting for data. Disconnecting.");
+                    }
+                    // This error means the client closed the connection gracefully
+                    io::ErrorKind::UnexpectedEof => {
+                        println!("Source client {address} disconnected gracefully.");
+                    }
+                    // Handle all other potential I/O errors.
+                    _ => {
+                        eprintln!("Error reading message from source {address}: {e}. Disconnecting.");
+                    }
+                }
                 break;
             }
+
         }
     }
 }

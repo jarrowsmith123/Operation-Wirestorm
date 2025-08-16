@@ -20,7 +20,7 @@ class TestSolution(unittest.TestCase):
     The senders/receivers are torn down between each test so they can be run in isolation.
     """
 
-    # Map of Thread ID -> Data Received
+    # Map of Thread ID -> Data Received5
     data_received: dict[int:bytes] = {}
     # Timeout for each receiver before assuming the connection is broken.
     receiver_timeout_s: int = 5
