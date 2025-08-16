@@ -71,7 +71,7 @@ For sensitive messages:
 
 ```bash
 # Install Rust via rustup 
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+curl https://sh.rustup.rs -sSf | sh
 
 # IMPORTANT: Reload your shell environment
 
